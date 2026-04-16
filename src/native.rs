@@ -26,6 +26,95 @@ use crate::{from_custom_addr, to_custom_addr, TRANSPORT_ID};
 
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 
+/// Perform a blocking STUN binding request to discover our public IP.
+/// Returns a server-reflexive candidate if successful.
+fn discover_srflx(stun_servers: &[String], local_port: u16) -> Option<str0m::Candidate> {
+    for server_uri in stun_servers {
+        // Parse "stun:host:port" format.
+        let addr_str = server_uri.strip_prefix("stun:")?;
+        let stun_addr: SocketAddr = match addr_str.to_socket_addrs() {
+            Ok(mut addrs) => addrs.next()?,
+            Err(_) => continue,
+        };
+
+        // Send a minimal STUN Binding Request (RFC 5389).
+        // Header: type=0x0001 (Binding Request), length=0, magic=0x2112A442, txn=random
+        let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+
+        let mut req = [0u8; 20];
+        req[0] = 0x00; req[1] = 0x01; // Binding Request
+        req[2] = 0x00; req[3] = 0x00; // Length = 0
+        req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42; // Magic Cookie
+        // Transaction ID (use current time as entropy — doesn't need to be crypto-random).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        req[8..20].copy_from_slice(&now.to_le_bytes()[..12]);
+
+        if sock.send_to(&req, stun_addr).is_err() {
+            continue;
+        }
+
+        let mut buf = [0u8; 256];
+        let n = match sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        // Parse STUN response — look for XOR-MAPPED-ADDRESS (0x0020) or
+        // MAPPED-ADDRESS (0x0001).
+        if n < 20 {
+            continue;
+        }
+        // Verify it's a Binding Success Response (0x0101).
+        if buf[0] != 0x01 || buf[1] != 0x01 {
+            continue;
+        }
+
+        let magic = [0x21, 0x12, 0xA4, 0x42];
+        let mut offset = 20; // Skip header.
+        while offset + 4 <= n {
+            let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+            let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+            let attr_start = offset + 4;
+
+            if attr_type == 0x0020 && attr_len >= 8 {
+                // XOR-MAPPED-ADDRESS: family(1) + port(2) + ip(4) for IPv4.
+                let family = buf[attr_start + 1];
+                if family == 0x01 {
+                    // IPv4
+                    let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]])
+                        ^ 0x2112; // XOR with magic cookie upper 16 bits
+                    let xor_ip = [
+                        buf[attr_start + 4] ^ magic[0],
+                        buf[attr_start + 5] ^ magic[1],
+                        buf[attr_start + 6] ^ magic[2],
+                        buf[attr_start + 7] ^ magic[3],
+                    ];
+                    let ip = std::net::Ipv4Addr::new(xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]);
+                    let public_addr = SocketAddr::new(ip.into(), xor_port);
+                    let local_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), local_port);
+
+                    tracing::debug!(%public_addr, %stun_addr, "STUN binding response");
+
+                    return str0m::Candidate::server_reflexive(public_addr, local_addr, "udp").ok();
+                }
+            }
+
+            // Pad to 4-byte boundary.
+            offset = attr_start + ((attr_len + 3) & !3);
+        }
+    }
+    None
+}
+
+use std::net::ToSocketAddrs;
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -70,7 +159,15 @@ struct SharedState {
     peers: HashMap<EndpointId, PeerState>,
     addr_to_peer: HashMap<SocketAddr, EndpointId>,
     signaling_out: mpsc::UnboundedSender<SignalingMessage>,
+    /// The real bound socket addr (0.0.0.0:port).
     local_addr: SocketAddr,
+    /// The address to use as `destination` when feeding packets to str0m.
+    /// Must match a local candidate's addr so str0m can pair it.
+    local_recv_addr: SocketAddr,
+    /// All local host candidates (real interface IPs + bound port).
+    local_candidates: Vec<str0m::Candidate>,
+    /// Server-reflexive candidate (public IP from STUN), if discovered.
+    srflx_candidate: Option<str0m::Candidate>,
     recv_queue_tx: mpsc::UnboundedSender<IncomingPacket>,
 }
 
@@ -87,6 +184,34 @@ impl std::fmt::Debug for SharedState {
 impl SharedState {
     fn new_rtc(&self) -> Rtc {
         Rtc::new(Instant::now())
+    }
+
+    /// Add all known local + srflx candidates to an Rtc instance,
+    /// and send them as ICE signaling messages.
+    fn add_candidates_and_signal(
+        &self,
+        rtc: &mut Rtc,
+        local_id_hex: &str,
+        remote_id_hex: &str,
+    ) {
+        for c in &self.local_candidates {
+            rtc.add_local_candidate(c.clone());
+            let _ = self.signaling_out.send(SignalingMessage::IceCandidate {
+                from: local_id_hex.to_string(),
+                to: remote_id_hex.to_string(),
+                candidate: c.to_sdp_string(),
+                sdp_m_line_index: Some(0),
+            });
+        }
+        if let Some(ref c) = self.srflx_candidate {
+            rtc.add_local_candidate(c.clone());
+            let _ = self.signaling_out.send(SignalingMessage::IceCandidate {
+                from: local_id_hex.to_string(),
+                to: remote_id_hex.to_string(),
+                candidate: c.to_sdp_string(),
+                sdp_m_line_index: Some(0),
+            });
+        }
     }
 
     fn local_id_hex(&self) -> String {
@@ -172,16 +297,8 @@ impl SharedState {
 
                 match self.create_answerer(&sdp) {
                     Ok((mut rtc, answer_sdp)) => {
-                        if let Ok(c) = str0m::Candidate::host(self.local_addr, "udp") {
-                            rtc.add_local_candidate(c.clone());
-                            // Send our ICE candidate to the offerer.
-                            let _ = self.signaling_out.send(SignalingMessage::IceCandidate {
-                                from: self.local_id_hex(),
-                                to: from.clone(),
-                                candidate: c.to_sdp_string(),
-                                sdp_m_line_index: Some(0),
-                            });
-                        }
+                        let local_id_hex = self.local_id_hex();
+                        self.add_candidates_and_signal(&mut rtc, &local_id_hex, &from);
                         self.peers.insert(remote_id, PeerState {
                             rtc,
                             channel_id: None,
@@ -270,7 +387,7 @@ async fn io_loop(
                         if len == 0 { continue; }
                         let data = udp_buf[..len].to_vec();
                         let mut s = state.lock();
-                        let local_addr = s.local_addr;
+                        let local_addr = s.local_recv_addr;
 
                         // Route by known source addr.
                         let remote_id = s.addr_to_peer.get(&source).copied();
@@ -368,15 +485,51 @@ impl std::fmt::Debug for WebRtcTransport {
 
 impl CustomTransport for WebRtcTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        // Bind UDP socket for str0m I/O.
-        // Bind to localhost for now. A real deployment would bind 0.0.0.0
-        // and gather ICE candidates for all interfaces.
-        let std_socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        // Bind UDP socket on all interfaces for str0m I/O.
+        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
         std_socket.set_nonblocking(true)?;
         let local_addr = std_socket.local_addr()?;
+        let port = local_addr.port();
         let udp_socket = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
 
-        tracing::info!(%local_addr, "WebRTC transport bound");
+        // Gather host candidates from local network interfaces.
+        let mut local_candidates = Vec::new();
+
+        // Always add localhost candidate (needed for same-machine connections).
+        let localhost_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
+        if let Ok(c) = str0m::Candidate::host(localhost_addr, "udp") {
+            local_candidates.push(c);
+        }
+
+        // Discover the default LAN IP by connecting to a public address.
+        if let Ok(ifaces) = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| {
+                s.connect("8.8.8.8:80")?;
+                s.local_addr()
+            })
+        {
+            let addr = SocketAddr::new(ifaces.ip(), port);
+            if !addr.ip().is_loopback() {
+                if let Ok(c) = str0m::Candidate::host(addr, "udp") {
+                    tracing::info!(%addr, "WebRTC LAN host candidate");
+                    local_candidates.push(c);
+                }
+            }
+        }
+
+        // STUN: discover server-reflexive (public) candidate.
+        let srflx_candidate = discover_srflx(&self.stun_servers, port);
+        if let Some(ref c) = srflx_candidate {
+            tracing::info!(candidate = %c.to_sdp_string(), "WebRTC srflx candidate");
+        }
+
+        tracing::info!(%local_addr, candidates = local_candidates.len(), has_srflx = srflx_candidate.is_some(), "WebRTC transport bound");
+
+        // Use the first candidate's address as the recv destination for str0m.
+        let local_recv_addr = local_candidates
+            .first()
+            .map(|c| c.addr())
+            .unwrap_or(local_addr);
 
         let state = Arc::new(Mutex::new(SharedState {
             local_id: Some(self.local_id),
@@ -384,6 +537,9 @@ impl CustomTransport for WebRtcTransport {
             addr_to_peer: HashMap::new(),
             signaling_out: self.signaling_out.clone(),
             local_addr,
+            local_recv_addr,
+            local_candidates,
+            srflx_candidate,
             recv_queue_tx: self.recv_queue_tx.clone(),
         }));
 
@@ -551,28 +707,13 @@ impl CustomSender for WebRtcSender {
                     let local_id_hex = state.local_id_hex();
                     let remote_id_hex = format!("{remote_id}");
 
-                    if let Ok(c) = str0m::Candidate::host(state.local_addr, "udp") {
-                        rtc.add_local_candidate(c.clone());
-
-                        // Send offer first, then ICE candidate.
-                        let _ = state.signaling_out.send(SignalingMessage::Offer {
-                            from: local_id_hex.clone(),
-                            to: remote_id_hex.clone(),
-                            sdp: offer_sdp,
-                        });
-                        let _ = state.signaling_out.send(SignalingMessage::IceCandidate {
-                            from: local_id_hex,
-                            to: remote_id_hex,
-                            candidate: c.to_sdp_string(),
-                            sdp_m_line_index: Some(0),
-                        });
-                    } else {
-                        let _ = state.signaling_out.send(SignalingMessage::Offer {
-                            from: local_id_hex,
-                            to: remote_id_hex,
-                            sdp: offer_sdp,
-                        });
-                    }
+                    // Send offer first, then ICE candidates.
+                    let _ = state.signaling_out.send(SignalingMessage::Offer {
+                        from: local_id_hex.clone(),
+                        to: remote_id_hex.clone(),
+                        sdp: offer_sdp,
+                    });
+                    state.add_candidates_and_signal(&mut rtc, &local_id_hex, &remote_id_hex);
 
                     state.peers.insert(remote_id, PeerState {
                         rtc,
