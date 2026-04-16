@@ -271,10 +271,15 @@ impl SharedState {
         };
         let from_addr = to_custom_addr(*remote_id);
 
+        let mut transmit_count = 0u32;
         loop {
             match peer.rtc.poll_output() {
                 Ok(Output::Transmit(t)) => {
-                    let _ = udp_socket.try_send_to(&t.contents, t.destination);
+                    transmit_count += 1;
+                    match udp_socket.try_send_to(&t.contents, t.destination) {
+                        Ok(n) => tracing::trace!(remote = %remote_id.fmt_short(), dest = %t.destination, bytes = n, "UDP sent"),
+                        Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), dest = %t.destination, %e, "UDP send failed"),
+                    }
                 }
                 Ok(Output::Event(Event::ChannelOpen(ch_id, label))) => {
                     tracing::info!(remote = %remote_id.fmt_short(), %label, "data channel open");
@@ -296,15 +301,20 @@ impl SharedState {
                     peer.conn_state = ConnState::Connecting;
                 }
                 Ok(Output::Event(Event::IceConnectionStateChange(s))) => {
-                    tracing::debug!(remote = %remote_id.fmt_short(), ?s, "ICE state");
+                    tracing::info!(remote = %remote_id.fmt_short(), ?s, "ICE state change");
                 }
-                Ok(Output::Event(_)) => {}
+                Ok(Output::Event(ev)) => {
+                    tracing::debug!(remote = %remote_id.fmt_short(), ?ev, "str0m event");
+                }
                 Ok(Output::Timeout(_)) => break,
                 Err(e) => {
                     tracing::warn!(remote = %remote_id.fmt_short(), %e, "str0m error");
                     break;
                 }
             }
+        }
+        if transmit_count > 0 {
+            tracing::debug!(remote = %remote_id.fmt_short(), count = transmit_count, "drive_peer flushed UDP transmits");
         }
     }
 
@@ -316,14 +326,19 @@ impl SharedState {
         match msg {
             SignalingMessage::Offer { from, sdp, .. } => {
                 let Ok(remote_id) = from.parse::<EndpointId>() else {
+                    tracing::warn!(from, "bad remote endpoint id in offer");
                     return;
                 };
-                tracing::debug!(remote = %remote_id.fmt_short(), "received SDP offer");
+                tracing::info!(remote = %remote_id.fmt_short(), sdp_len = sdp.len(), "received SDP offer");
 
                 match self.create_answerer(&sdp) {
                     Ok((mut rtc, answer_sdp)) => {
+                        tracing::info!(remote = %remote_id.fmt_short(), answer_len = answer_sdp.len(), "created answer");
                         let local_id_hex = self.local_id_hex();
+                        let local_count = self.local_candidates.len();
+                        let has_srflx = self.srflx_candidate.is_some();
                         self.add_candidates_and_signal(&mut rtc, &local_id_hex, &from);
+                        tracing::info!(remote = %remote_id.fmt_short(), local_count, has_srflx, "added local candidates to peer + sent via signaling");
                         self.peers.insert(remote_id, PeerState {
                             rtc,
                             channel_id: None,
@@ -339,12 +354,13 @@ impl SharedState {
                         });
                         self.drive_peer(&remote_id, udp_socket);
                     }
-                    Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), %e, "answer failed"),
+                    Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), %e, "create_answerer failed"),
                 }
             }
 
             SignalingMessage::Answer { from, sdp, .. } => {
                 let Ok(remote_id) = from.parse::<EndpointId>() else {
+                    tracing::warn!(from, "bad remote endpoint id in answer");
                     return;
                 };
                 if let Some(peer) = self.peers.get_mut(&remote_id) {
@@ -354,30 +370,38 @@ impl SharedState {
                                 if let Err(e) = peer.rtc.sdp_api().accept_answer(pending, answer) {
                                     tracing::warn!(remote = %remote_id.fmt_short(), %e, "accept_answer failed");
                                 } else {
-                                    tracing::debug!(remote = %remote_id.fmt_short(), "SDP answer accepted");
+                                    tracing::info!(remote = %remote_id.fmt_short(), "SDP answer accepted");
                                 }
                             }
                             Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), %e, "invalid SDP answer"),
                         }
+                    } else {
+                        tracing::warn!(remote = %remote_id.fmt_short(), "received answer but no pending offer");
                     }
+                } else {
+                    tracing::warn!(remote = %remote_id.fmt_short(), "received answer for unknown peer");
                 }
                 self.drive_peer(&remote_id, udp_socket);
             }
 
             SignalingMessage::IceCandidate { from, candidate, .. } => {
                 let Ok(remote_id) = from.parse::<EndpointId>() else {
+                    tracing::warn!(from, "bad remote endpoint id in ice");
                     return;
                 };
                 if let Some(peer) = self.peers.get_mut(&remote_id) {
                     match str0m::Candidate::from_sdp_string(&candidate) {
                         Ok(c) => {
                             let addr = c.addr();
+                            tracing::info!(remote = %remote_id.fmt_short(), %addr, kind = ?c.kind(), "added remote ICE candidate");
                             peer.rtc.add_remote_candidate(c);
                             self.addr_to_peer.insert(addr, remote_id);
                             peer.remote_addr = Some(addr);
                         }
-                        Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), %e, "bad ICE candidate"),
+                        Err(e) => tracing::warn!(remote = %remote_id.fmt_short(), candidate, %e, "failed to parse remote ICE candidate"),
                     }
+                } else {
+                    tracing::warn!(remote = %remote_id.fmt_short(), candidate, "received ICE for unknown peer");
                 }
                 self.drive_peer(&remote_id, udp_socket);
             }
@@ -417,6 +441,7 @@ async fn io_loop(
                         // Route by known source addr.
                         let remote_id = s.addr_to_peer.get(&source).copied();
                         if let Some(id) = remote_id {
+                            tracing::trace!(%source, len, remote = %id.fmt_short(), "UDP recv (known peer)");
                             if let Some(peer) = s.peers.get_mut(&id) {
                                 if let Ok(recv) = Receive::new(Protocol::Udp, source, local_addr, &data) {
                                     let _ = peer.rtc.handle_input(Input::Receive(Instant::now(), recv));
@@ -424,18 +449,25 @@ async fn io_loop(
                             }
                             s.drive_peer(&id, &udp_socket);
                         } else {
+                            tracing::info!(%source, len, peers = s.peers.len(), "UDP recv (unknown source, trying all peers)");
                             // Unknown source — try all peers.
                             let ids: Vec<_> = s.peers.keys().copied().collect();
+                            let mut matched = false;
                             for id in ids {
                                 if let Some(peer) = s.peers.get_mut(&id) {
                                     if let Ok(recv) = Receive::new(Protocol::Udp, source, local_addr, &data) {
                                         if peer.rtc.handle_input(Input::Receive(Instant::now(), recv)).is_ok() {
+                                            tracing::info!(%source, remote = %id.fmt_short(), "UDP source matched to peer");
                                             s.addr_to_peer.insert(source, id);
                                             s.drive_peer(&id, &udp_socket);
+                                            matched = true;
                                             break;
                                         }
                                     }
                                 }
+                            }
+                            if !matched {
+                                tracing::warn!(%source, "UDP packet didn't match any peer");
                             }
                         }
                     }
