@@ -31,84 +31,109 @@ const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 fn discover_srflx(stun_servers: &[String], local_port: u16) -> Option<str0m::Candidate> {
     for server_uri in stun_servers {
         // Parse "stun:host:port" format.
-        let addr_str = server_uri.strip_prefix("stun:")?;
-        let stun_addr: SocketAddr = match addr_str.to_socket_addrs() {
-            Ok(mut addrs) => addrs.next()?,
-            Err(_) => continue,
+        let Some(addr_str) = server_uri.strip_prefix("stun:") else {
+            continue;
         };
 
-        // Send a minimal STUN Binding Request (RFC 5389).
-        // Header: type=0x0001 (Binding Request), length=0, magic=0x2112A442, txn=random
-        let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-
-        let mut req = [0u8; 20];
-        req[0] = 0x00; req[1] = 0x01; // Binding Request
-        req[2] = 0x00; req[3] = 0x00; // Length = 0
-        req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42; // Magic Cookie
-        // Transaction ID (use current time as entropy — doesn't need to be crypto-random).
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        req[8..20].copy_from_slice(&now.to_le_bytes()[..12]);
-
-        if sock.send_to(&req, stun_addr).is_err() {
-            continue;
-        }
-
-        let mut buf = [0u8; 256];
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-
-        // Parse STUN response — look for XOR-MAPPED-ADDRESS (0x0020) or
-        // MAPPED-ADDRESS (0x0001).
-        if n < 20 {
-            continue;
-        }
-        // Verify it's a Binding Success Response (0x0101).
-        if buf[0] != 0x01 || buf[1] != 0x01 {
-            continue;
-        }
-
-        let magic = [0x21, 0x12, 0xA4, 0x42];
-        let mut offset = 20; // Skip header.
-        while offset + 4 <= n {
-            let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
-            let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
-            let attr_start = offset + 4;
-
-            if attr_type == 0x0020 && attr_len >= 8 {
-                // XOR-MAPPED-ADDRESS: family(1) + port(2) + ip(4) for IPv4.
-                let family = buf[attr_start + 1];
-                if family == 0x01 {
-                    // IPv4
-                    let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]])
-                        ^ 0x2112; // XOR with magic cookie upper 16 bits
-                    let xor_ip = [
-                        buf[attr_start + 4] ^ magic[0],
-                        buf[attr_start + 5] ^ magic[1],
-                        buf[attr_start + 6] ^ magic[2],
-                        buf[attr_start + 7] ^ magic[3],
-                    ];
-                    let ip = std::net::Ipv4Addr::new(xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]);
-                    let public_addr = SocketAddr::new(ip.into(), xor_port);
-                    let local_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), local_port);
-
-                    tracing::debug!(%public_addr, %stun_addr, "STUN binding response");
-
-                    return str0m::Candidate::server_reflexive(public_addr, local_addr, "udp").ok();
-                }
+        // Resolve DNS — may return multiple addresses (IPv4 + IPv6).
+        // Try each in turn; our response parser only handles IPv4 so we
+        // prefer IPv4 addresses first.
+        let addrs: Vec<SocketAddr> = match addr_str.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut v: Vec<_> = addrs.collect();
+                // IPv4 first.
+                v.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+                v
             }
+            Err(e) => {
+                tracing::debug!(%server_uri, %e, "STUN DNS resolution failed");
+                continue;
+            }
+        };
 
-            // Pad to 4-byte boundary.
-            offset = attr_start + ((attr_len + 3) & !3);
+        if addrs.is_empty() {
+            tracing::debug!(%server_uri, "STUN resolved to no addresses");
+            continue;
         }
+
+        tracing::debug!(%server_uri, resolved = ?addrs, "STUN resolving");
+
+        for stun_addr in addrs {
+            // Bind socket matching the address family.
+            let bind_addr = if stun_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let sock = match std::net::UdpSocket::bind(bind_addr) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(%e, %bind_addr, "STUN socket bind failed");
+                    continue;
+                }
+            };
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+
+            let mut req = [0u8; 20];
+            req[0] = 0x00; req[1] = 0x01;
+            req[2] = 0x00; req[3] = 0x00;
+            req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            req[8..20].copy_from_slice(&now.to_le_bytes()[..12]);
+
+            if let Err(e) = sock.send_to(&req, stun_addr) {
+                tracing::debug!(%stun_addr, %e, "STUN send failed");
+                continue;
+            }
+            tracing::debug!(%stun_addr, "STUN request sent");
+
+            let mut buf = [0u8; 256];
+            let n = match sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!(%stun_addr, %e, "STUN recv timeout/error");
+                    continue;
+                }
+            };
+
+            if let Some(c) = parse_stun_response(&buf[..n], stun_addr, local_port) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Parse a STUN Binding Success Response and extract XOR-MAPPED-ADDRESS (IPv4).
+fn parse_stun_response(buf: &[u8], stun_addr: SocketAddr, local_port: u16) -> Option<str0m::Candidate> {
+    if buf.len() < 20 { return None; }
+    // Verify Binding Success Response (0x0101).
+    if buf[0] != 0x01 || buf[1] != 0x01 { return None; }
+
+    let magic = [0x21, 0x12, 0xA4, 0x42];
+    let mut offset = 20;
+    while offset + 4 <= buf.len() {
+        let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
+        let attr_start = offset + 4;
+
+        if attr_type == 0x0020 && attr_len >= 8 {
+            let family = buf[attr_start + 1];
+            if family == 0x01 {
+                let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+                let xor_ip = [
+                    buf[attr_start + 4] ^ magic[0],
+                    buf[attr_start + 5] ^ magic[1],
+                    buf[attr_start + 6] ^ magic[2],
+                    buf[attr_start + 7] ^ magic[3],
+                ];
+                let ip = std::net::Ipv4Addr::new(xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]);
+                let public_addr = SocketAddr::new(ip.into(), xor_port);
+                let local_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), local_port);
+                tracing::info!(%public_addr, %stun_addr, "STUN: got public address");
+                return str0m::Candidate::server_reflexive(public_addr, local_addr, "udp").ok();
+            }
+        }
+        offset = attr_start + ((attr_len + 3) & !3);
     }
     None
 }
