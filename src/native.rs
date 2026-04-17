@@ -208,7 +208,14 @@ impl std::fmt::Debug for SharedState {
 
 impl SharedState {
     fn new_rtc(&self) -> Rtc {
-        Rtc::new(Instant::now())
+        // Build Rtc with tuned ICE timeouts for residential NAT traversal.
+        // Defaults: initial_rto=250ms, max_rto=3s, max_retransmits=9 (~30s total).
+        // We give it more headroom: more retransmits and longer max RTO,
+        // since home NATs can have intermittent packet loss.
+        let mut cfg = Rtc::builder();
+        cfg.set_max_stun_retransmits(20);
+        cfg.set_max_stun_rto(Duration::from_secs(5));
+        cfg.build(Instant::now())
     }
 
     /// Add all known local + srflx candidates to an Rtc instance,
@@ -303,8 +310,11 @@ impl SharedState {
                 Ok(Output::Event(Event::IceConnectionStateChange(s))) => {
                     tracing::info!(remote = %remote_id.fmt_short(), ?s, "ICE state change");
                 }
+                Ok(Output::Event(Event::Connected)) => {
+                    tracing::info!(remote = %remote_id.fmt_short(), "ICE + DTLS connected");
+                }
                 Ok(Output::Event(ev)) => {
-                    tracing::debug!(remote = %remote_id.fmt_short(), ?ev, "str0m event");
+                    tracing::info!(remote = %remote_id.fmt_short(), ?ev, "str0m event");
                 }
                 Ok(Output::Timeout(_)) => break,
                 Err(e) => {
