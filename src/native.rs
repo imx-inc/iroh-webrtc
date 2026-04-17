@@ -26,8 +26,43 @@ use crate::{from_custom_addr, to_custom_addr, TRANSPORT_ID};
 
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 
+/// Perform a STUN binding request to ONE STUN server, filtering to a single
+/// address family (IPv4 or IPv6). Returns a server-reflexive candidate on success.
+fn discover_srflx_one(
+    server_uri: &str,
+    local_port: u16,
+    want_v6: bool,
+) -> Option<str0m::Candidate> {
+    let addr_str = server_uri.strip_prefix("stun:")?;
+
+    let stun_addr = addr_str
+        .to_socket_addrs()
+        .ok()?
+        .find(|a| a.is_ipv6() == want_v6)?;
+
+    let bind_addr = if stun_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let sock = std::net::UdpSocket::bind(bind_addr).ok()?;
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+
+    let mut req = [0u8; 20];
+    req[0] = 0x00; req[1] = 0x01;
+    req[4] = 0x21; req[5] = 0x12; req[6] = 0xA4; req[7] = 0x42;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    req[8..20].copy_from_slice(&now.to_le_bytes()[..12]);
+
+    sock.send_to(&req, stun_addr).ok()?;
+
+    let mut buf = [0u8; 256];
+    let n = sock.recv(&mut buf).ok()?;
+    parse_stun_response(&buf[..n], stun_addr, local_port)
+}
+
 /// Perform a blocking STUN binding request to discover our public IP.
 /// Returns a server-reflexive candidate if successful.
+#[allow(dead_code)]
 fn discover_srflx(stun_servers: &[String], local_port: u16) -> Option<str0m::Candidate> {
     for server_uri in stun_servers {
         // Parse "stun:host:port" format.
@@ -106,20 +141,23 @@ fn discover_srflx(stun_servers: &[String], local_port: u16) -> Option<str0m::Can
 /// Parse a STUN Binding Success Response and extract XOR-MAPPED-ADDRESS (IPv4).
 fn parse_stun_response(buf: &[u8], stun_addr: SocketAddr, local_port: u16) -> Option<str0m::Candidate> {
     if buf.len() < 20 { return None; }
-    // Verify Binding Success Response (0x0101).
     if buf[0] != 0x01 || buf[1] != 0x01 { return None; }
 
     let magic = [0x21, 0x12, 0xA4, 0x42];
+    let txn_id = &buf[8..20]; // Last 12 bytes of header (for IPv6 XOR).
     let mut offset = 20;
     while offset + 4 <= buf.len() {
         let attr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
         let attr_len = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
         let attr_start = offset + 4;
 
-        if attr_type == 0x0020 && attr_len >= 8 {
+        if attr_type == 0x0020 {
             let family = buf[attr_start + 1];
-            if family == 0x01 {
-                let xor_port = u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+            let xor_port =
+                u16::from_be_bytes([buf[attr_start + 2], buf[attr_start + 3]]) ^ 0x2112;
+
+            if family == 0x01 && attr_len >= 8 {
+                // IPv4: XOR with magic cookie.
                 let xor_ip = [
                     buf[attr_start + 4] ^ magic[0],
                     buf[attr_start + 5] ^ magic[1],
@@ -128,8 +166,22 @@ fn parse_stun_response(buf: &[u8], stun_addr: SocketAddr, local_port: u16) -> Op
                 ];
                 let ip = std::net::Ipv4Addr::new(xor_ip[0], xor_ip[1], xor_ip[2], xor_ip[3]);
                 let public_addr = SocketAddr::new(ip.into(), xor_port);
-                let local_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), local_port);
-                tracing::info!(%public_addr, %stun_addr, "STUN: got public address");
+                let local_addr =
+                    SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), local_port);
+                tracing::info!(%public_addr, %stun_addr, "STUN: got public IPv4");
+                return str0m::Candidate::server_reflexive(public_addr, local_addr, "udp").ok();
+            } else if family == 0x02 && attr_len >= 20 {
+                // IPv6: XOR with magic cookie + transaction ID.
+                let mut xor_ip = [0u8; 16];
+                for i in 0..16 {
+                    let xor_byte = if i < 4 { magic[i] } else { txn_id[i - 4] };
+                    xor_ip[i] = buf[attr_start + 4 + i] ^ xor_byte;
+                }
+                let ip = std::net::Ipv6Addr::from(xor_ip);
+                let public_addr = SocketAddr::new(ip.into(), xor_port);
+                let local_addr =
+                    SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), local_port);
+                tracing::info!(%public_addr, %stun_addr, "STUN: got public IPv6");
                 return str0m::Candidate::server_reflexive(public_addr, local_addr, "udp").ok();
             }
         }
@@ -186,13 +238,12 @@ struct SharedState {
     signaling_out: mpsc::UnboundedSender<SignalingMessage>,
     /// The real bound socket addr (0.0.0.0:port).
     local_addr: SocketAddr,
-    /// The address to use as `destination` when feeding packets to str0m.
-    /// Must match a local candidate's addr so str0m can pair it.
-    local_recv_addr: SocketAddr,
-    /// All local host candidates (real interface IPs + bound port).
+    /// The IPv4 address to use as `destination` when feeding IPv4 packets to str0m.
+    local_recv_addr_v4: SocketAddr,
+    /// The IPv6 address to use as `destination` when feeding IPv6 packets to str0m.
+    local_recv_addr_v6: SocketAddr,
+    /// All local host + srflx candidates (IPv4 + IPv6).
     local_candidates: Vec<str0m::Candidate>,
-    /// Server-reflexive candidate (public IP from STUN), if discovered.
-    srflx_candidate: Option<str0m::Candidate>,
     recv_queue_tx: mpsc::UnboundedSender<IncomingPacket>,
 }
 
@@ -227,15 +278,6 @@ impl SharedState {
         remote_id_hex: &str,
     ) {
         for c in &self.local_candidates {
-            rtc.add_local_candidate(c.clone());
-            let _ = self.signaling_out.send(SignalingMessage::IceCandidate {
-                from: local_id_hex.to_string(),
-                to: remote_id_hex.to_string(),
-                candidate: c.to_sdp_string(),
-                sdp_m_line_index: Some(0),
-            });
-        }
-        if let Some(ref c) = self.srflx_candidate {
             rtc.add_local_candidate(c.clone());
             let _ = self.signaling_out.send(SignalingMessage::IceCandidate {
                 from: local_id_hex.to_string(),
@@ -345,10 +387,9 @@ impl SharedState {
                     Ok((mut rtc, answer_sdp)) => {
                         tracing::info!(remote = %remote_id.fmt_short(), answer_len = answer_sdp.len(), "created answer");
                         let local_id_hex = self.local_id_hex();
-                        let local_count = self.local_candidates.len();
-                        let has_srflx = self.srflx_candidate.is_some();
+                        let candidate_count = self.local_candidates.len();
                         self.add_candidates_and_signal(&mut rtc, &local_id_hex, &from);
-                        tracing::info!(remote = %remote_id.fmt_short(), local_count, has_srflx, "added local candidates to peer + sent via signaling");
+                        tracing::info!(remote = %remote_id.fmt_short(), candidate_count, "added local candidates to peer + sent via signaling");
                         self.peers.insert(remote_id, PeerState {
                             rtc,
                             channel_id: None,
@@ -446,7 +487,12 @@ async fn io_loop(
                         if len == 0 { continue; }
                         let data = udp_buf[..len].to_vec();
                         let mut s = state.lock();
-                        let local_addr = s.local_recv_addr;
+                        // Use IPv4 or IPv6 local_recv_addr to match the source's family.
+                        let local_addr = if source.is_ipv4() {
+                            s.local_recv_addr_v4
+                        } else {
+                            s.local_recv_addr_v6
+                        };
 
                         // Route by known source addr.
                         let remote_id = s.addr_to_peer.get(&source).copied();
@@ -552,8 +598,11 @@ impl std::fmt::Debug for WebRtcTransport {
 
 impl CustomTransport for WebRtcTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        // Bind UDP socket on all interfaces for str0m I/O.
-        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        // Bind UDP socket as dual-stack (IPv6 + IPv4 via v4-mapped addresses).
+        let std_socket = match std::net::UdpSocket::bind("[::]:0") {
+            Ok(s) => s,
+            Err(_) => std::net::UdpSocket::bind("0.0.0.0:0")?, // Fallback if no IPv6
+        };
         std_socket.set_nonblocking(true)?;
         let local_addr = std_socket.local_addr()?;
         let port = local_addr.port();
@@ -562,13 +611,13 @@ impl CustomTransport for WebRtcTransport {
         // Gather host candidates from local network interfaces.
         let mut local_candidates = Vec::new();
 
-        // Always add localhost candidate (needed for same-machine connections).
-        let localhost_addr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
-        if let Ok(c) = str0m::Candidate::host(localhost_addr, "udp") {
+        // Always add localhost IPv4 candidate (needed for same-machine tests).
+        let localhost_v4 = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
+        if let Ok(c) = str0m::Candidate::host(localhost_v4, "udp") {
             local_candidates.push(c);
         }
 
-        // Discover the default LAN IP by connecting to a public address.
+        // Discover the default IPv4 LAN IP.
         if let Ok(ifaces) = std::net::UdpSocket::bind("0.0.0.0:0")
             .and_then(|s| {
                 s.connect("8.8.8.8:80")?;
@@ -578,25 +627,60 @@ impl CustomTransport for WebRtcTransport {
             let addr = SocketAddr::new(ifaces.ip(), port);
             if !addr.ip().is_loopback() {
                 if let Ok(c) = str0m::Candidate::host(addr, "udp") {
-                    tracing::info!(%addr, "WebRTC LAN host candidate");
+                    tracing::info!(%addr, "WebRTC IPv4 host candidate");
                     local_candidates.push(c);
                 }
             }
         }
 
-        // STUN: discover server-reflexive (public) candidate.
-        let srflx_candidate = discover_srflx(&self.stun_servers, port);
-        if let Some(ref c) = srflx_candidate {
-            tracing::info!(candidate = %c.to_sdp_string(), "WebRTC srflx candidate");
+        // Discover the default IPv6 address.
+        if let Ok(ifaces) = std::net::UdpSocket::bind("[::]:0")
+            .and_then(|s| {
+                s.connect("[2001:4860:4860::8888]:80")?;
+                s.local_addr()
+            })
+        {
+            let addr = SocketAddr::new(ifaces.ip(), port);
+            if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
+                if let Ok(c) = str0m::Candidate::host(addr, "udp") {
+                    tracing::info!(%addr, "WebRTC IPv6 host candidate");
+                    local_candidates.push(c);
+                }
+            }
         }
 
-        tracing::info!(%local_addr, candidates = local_candidates.len(), has_srflx = srflx_candidate.is_some(), "WebRTC transport bound");
+        // STUN: discover server-reflexive candidates for both IPv4 and IPv6.
+        let mut srflx_candidates = Vec::new();
+        for server_uri in &self.stun_servers {
+            for try_v6 in [false, true] {
+                if let Some(c) = discover_srflx_one(server_uri, port, try_v6) {
+                    tracing::info!(candidate = %c.to_sdp_string(), "WebRTC srflx candidate");
+                    srflx_candidates.push(c);
+                }
+            }
+        }
 
-        // Use the first candidate's address as the recv destination for str0m.
-        let local_recv_addr = local_candidates
-            .first()
+        tracing::info!(
+            %local_addr,
+            host_candidates = local_candidates.len(),
+            srflx_candidates = srflx_candidates.len(),
+            "WebRTC transport bound"
+        );
+
+        local_candidates.extend(srflx_candidates);
+
+        // Pick recv destinations per family: first v4 / first v6 candidate,
+        // falling back to unspecified addr with the bound port.
+        let local_recv_addr_v4 = local_candidates
+            .iter()
+            .find(|c| c.addr().is_ipv4())
             .map(|c| c.addr())
-            .unwrap_or(local_addr);
+            .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port));
+        let local_recv_addr_v6 = local_candidates
+            .iter()
+            .find(|c| c.addr().is_ipv6())
+            .map(|c| c.addr())
+            .unwrap_or_else(|| SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port));
 
         let state = Arc::new(Mutex::new(SharedState {
             local_id: Some(self.local_id),
@@ -604,9 +688,9 @@ impl CustomTransport for WebRtcTransport {
             addr_to_peer: HashMap::new(),
             signaling_out: self.signaling_out.clone(),
             local_addr,
-            local_recv_addr,
+            local_recv_addr_v4,
+            local_recv_addr_v6,
             local_candidates,
-            srflx_candidate,
             recv_queue_tx: self.recv_queue_tx.clone(),
         }));
 
