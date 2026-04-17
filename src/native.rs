@@ -26,6 +26,17 @@ use crate::{from_custom_addr, to_custom_addr, TRANSPORT_ID};
 
 const DATA_CHANNEL_LABEL: &str = "iroh-quic";
 
+/// Unmap an IPv4-in-IPv6 address (::ffff:a.b.c.d) to plain IPv4.
+/// Dual-stack UDP sockets return IPv4 packets in this form by default.
+fn unmap_v4(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::new(v4.into(), v6.port());
+        }
+    }
+    addr
+}
+
 /// Perform a STUN binding request to ONE STUN server, filtering to a single
 /// address family (IPv4 or IPv6). Returns a server-reflexive candidate on success.
 fn discover_srflx_one(
@@ -486,8 +497,14 @@ async fn io_loop(
                     Ok((len, source)) => {
                         if len == 0 { continue; }
                         let data = udp_buf[..len].to_vec();
+
+                        // Dual-stack sockets return IPv4 packets as v4-mapped IPv6
+                        // (::ffff:a.b.c.d). Unmap so source.is_ipv4() works and
+                        // ICE candidate matching sees plain IPv4.
+                        let source = unmap_v4(source);
+
                         let mut s = state.lock();
-                        // Use IPv4 or IPv6 local_recv_addr to match the source's family.
+                        // Pick local_addr matching the source's family.
                         let local_addr = if source.is_ipv4() {
                             s.local_recv_addr_v4
                         } else {
