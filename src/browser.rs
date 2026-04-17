@@ -76,6 +76,11 @@ impl std::fmt::Debug for BrowserPeerState {
 struct BrowserState {
     local_id: EndpointId,
     peers: HashMap<EndpointId, BrowserPeerState>,
+    /// Peers for which we've started initiation but haven't yet inserted
+    /// into `peers`. Prevents duplicate initiation from rapid poll_send calls.
+    in_flight: std::collections::HashSet<EndpointId>,
+    /// Wakers per peer while initiation is in flight or connecting.
+    wakers: HashMap<EndpointId, Waker>,
     stun_servers: Vec<String>,
     signaling_out: mpsc::UnboundedSender<SignalingMessage>,
     recv_queue_tx: mpsc::UnboundedSender<IncomingPacket>,
@@ -157,6 +162,8 @@ impl WebRtcTransport {
         let state = SharedBrowserState::new(BrowserState {
             local_id,
             peers: HashMap::new(),
+            in_flight: std::collections::HashSet::new(),
+            wakers: HashMap::new(),
             stun_servers,
             signaling_out,
             recv_queue_tx: recv_tx,
@@ -333,19 +340,44 @@ async fn handle_answer(
     remote_id: EndpointId,
     sdp: &str,
 ) -> Result<(), JsValue> {
+    // Answer can arrive before `do_initiate` finishes inserting the peer.
+    // Wait briefly for the peer to appear.
     let pc = {
-        let s = state.borrow();
-        let peer = s.peers.get(&remote_id).ok_or("no peer for answer")?;
-        peer.pc.clone()
+        let mut tries = 0;
+        loop {
+            {
+                let s = state.borrow();
+                if let Some(peer) = s.peers.get(&remote_id) {
+                    break peer.pc.clone();
+                }
+            }
+            if tries >= 50 {
+                return Err(JsValue::from_str("no peer for answer after 5s"));
+            }
+            tries += 1;
+            sleep_ms(100).await;
+        }
     };
 
     let answer_init = web_sys::RtcSessionDescriptionInit::new(web_sys::RtcSdpType::Answer);
     answer_init.set_sdp(sdp);
     let promise = pc.set_remote_description(&answer_init);
     wasm_bindgen_futures::JsFuture::from(promise).await?;
-
-    tracing::debug!(remote = %remote_id.fmt_short(), "browser: SDP answer applied");
     Ok(())
+}
+
+/// WASM-compatible sleep via setTimeout.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let window = web_sys::window().expect("no window");
+        window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve,
+                ms,
+            )
+            .unwrap();
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
 async fn handle_ice_candidate(
@@ -354,10 +386,22 @@ async fn handle_ice_candidate(
     candidate: &str,
     sdp_m_line_index: Option<u16>,
 ) -> Result<(), JsValue> {
+    // Wait for peer to exist (same race as handle_answer).
     let pc = {
-        let s = state.borrow();
-        let peer = s.peers.get(&remote_id).ok_or("no peer for ICE")?;
-        peer.pc.clone()
+        let mut tries = 0;
+        loop {
+            {
+                let s = state.borrow();
+                if let Some(peer) = s.peers.get(&remote_id) {
+                    break peer.pc.clone();
+                }
+            }
+            if tries >= 50 {
+                return Err(JsValue::from_str("no peer for ICE after 5s"));
+            }
+            tries += 1;
+            sleep_ms(100).await;
+        }
     };
 
     let init = web_sys::RtcIceCandidateInit::new(candidate);
@@ -535,6 +579,12 @@ async fn do_initiate(state: &SharedBrowserState, remote_id: EndpointId) -> Resul
             waker: None,
             _closures: closures,
         });
+
+        // Initiation complete — clear in_flight and wake pending poll_send.
+        s.in_flight.remove(&remote_id);
+        if let Some(w) = s.wakers.remove(&remote_id) {
+            w.wake();
+        }
     }
 
     Ok(())
@@ -678,23 +728,20 @@ impl CustomSender for WebRtcSender {
                 }
             }
         } else {
-            // New peer — initiate WebRTC connection.
-            tracing::debug!(remote = %remote_id.fmt_short(), "browser: initiating WebRTC signaling");
-
-            // Insert placeholder so we don't initiate twice.
-            let pc = s.create_pc().map_err(|e| {
-                io::Error::other(format!("create_pc failed: {:?}", e))
-            })?;
-            s.peers.insert(remote_id, BrowserPeerState {
-                pc,
-                dc: None,
-                conn_state: ConnState::Connecting,
-                waker: Some(cx.waker().clone()),
-                _closures: vec![],
-            });
-            drop(s); // Release borrow before spawn_local.
-
-            initiate_connection(&self.state, remote_id);
+            // New peer — initiate WebRTC connection once. Subsequent poll_send
+            // calls while initiation is in-flight just register the waker.
+            s.wakers.insert(remote_id, cx.waker().clone());
+            if s.in_flight.insert(remote_id) {
+                web_sys::console::log_1(
+                    &format!(
+                        "[iroh-webrtc] poll_send: initiating WebRTC for {}",
+                        remote_id.fmt_short()
+                    )
+                    .into(),
+                );
+                drop(s);
+                initiate_connection(&self.state, remote_id);
+            }
 
             Poll::Pending
         }
