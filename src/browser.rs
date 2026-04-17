@@ -220,31 +220,34 @@ fn handle_signaling(state: &SharedBrowserState, msg: SignalingMessage) {
     match msg {
         SignalingMessage::Offer { from, sdp, .. } => {
             let Ok(remote_id) = from.parse::<EndpointId>() else {
+                web_sys::console::warn_1(&format!("[iroh-webrtc] bad offer from: {from}").into());
                 return;
             };
-            tracing::debug!(remote = %remote_id.fmt_short(), "browser: received SDP offer");
+            web_sys::console::log_1(&format!("[iroh-webrtc] received offer from {}", remote_id.fmt_short()).into());
 
             let state_clone = state.clone();
             let from_clone = from.clone();
 
-            // Create peer connection and set up answer flow.
             wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = handle_offer(&state_clone, remote_id, &from_clone, &sdp).await {
-                    tracing::warn!(remote = %remote_id.fmt_short(), "handle_offer failed: {:?}", e);
+                match handle_offer(&state_clone, remote_id, &from_clone, &sdp).await {
+                    Ok(_) => web_sys::console::log_1(&format!("[iroh-webrtc] offer handled + answer sent to {}", remote_id.fmt_short()).into()),
+                    Err(e) => web_sys::console::error_1(&format!("[iroh-webrtc] handle_offer failed for {}: {:?}", remote_id.fmt_short(), e).into()),
                 }
             });
         }
 
         SignalingMessage::Answer { from, sdp, .. } => {
             let Ok(remote_id) = from.parse::<EndpointId>() else {
+                web_sys::console::warn_1(&format!("[iroh-webrtc] bad answer from: {from}").into());
                 return;
             };
-            tracing::debug!(remote = %remote_id.fmt_short(), "browser: received SDP answer");
+            web_sys::console::log_1(&format!("[iroh-webrtc] received answer from {}, applying...", remote_id.fmt_short()).into());
 
             let state_clone = state.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Err(e) = handle_answer(&state_clone, remote_id, &sdp).await {
-                    tracing::warn!(remote = %remote_id.fmt_short(), "handle_answer failed: {:?}", e);
+                match handle_answer(&state_clone, remote_id, &sdp).await {
+                    Ok(_) => web_sys::console::log_1(&format!("[iroh-webrtc] answer applied to PC for {}", remote_id.fmt_short()).into()),
+                    Err(e) => web_sys::console::error_1(&format!("[iroh-webrtc] handle_answer failed for {}: {:?}", remote_id.fmt_short(), e).into()),
                 }
             });
         }
@@ -256,8 +259,10 @@ fn handle_signaling(state: &SharedBrowserState, msg: SignalingMessage) {
             ..
         } => {
             let Ok(remote_id) = from.parse::<EndpointId>() else {
+                web_sys::console::warn_1(&format!("[iroh-webrtc] bad ice from: {from}").into());
                 return;
             };
+            web_sys::console::log_1(&format!("[iroh-webrtc] adding remote ICE from {}: {candidate}", remote_id.fmt_short()).into());
 
             let state_clone = state.clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -265,7 +270,7 @@ fn handle_signaling(state: &SharedBrowserState, msg: SignalingMessage) {
                     handle_ice_candidate(&state_clone, remote_id, &candidate, sdp_m_line_index)
                         .await
                 {
-                    tracing::warn!(remote = %remote_id.fmt_short(), "handle_ice failed: {:?}", e);
+                    web_sys::console::error_1(&format!("[iroh-webrtc] handle_ice failed for {}: {:?}", remote_id.fmt_short(), e).into());
                 }
             });
         }
